@@ -138,22 +138,84 @@ def _dispatch_claude_cli(system: str, messages: list[dict]) -> tuple[str, str]:
     """v0.2 — Claude Code CLI subprocess. Uses local Claude Pro/Max session,
     no API key required.
 
-    UPIP work-dir pattern (per Jasper's "robot factory" architecture):
+    Two modes via `HOME_AGENT_CLAUDE_MODE`:
 
-        1. Daemon creates a sandboxed work-dir (/tmp/aint_task_<hex>/).
-        2. Writes the conversation as `instruction_blueprint.md`.
-        3. Runs `claude -p` with Read tool allowed, working-dir = sandbox.
-        4. Claude reads blueprint, replies in the JSON wrapper's `result`.
-        5. Daemon harvests, signs (TIBET via brain), tears down work-dir.
+      simple (default) — stdin-pipe passthrough. Fastest path: ~3-5 s for
+                         a typical chat-prompt. No tools, no work-dir, no
+                         Read-roundtrip. Best for the v0.1 chat-prompt
+                         payload shape (system + messages).
+
+      upip            — UPIP work-dir pattern (per Jasper's "robot factory"
+                         architecture). Daemon writes a sandboxed
+                         instruction_blueprint.md, claude reads it via the
+                         Read tool, harvests answer. ~12-17 s. Use when
+                         the payload carries L1/L2/L3 split or context
+                         attachments that benefit from on-disk presentation.
 
     No upstream API key on this side — `claude` uses its own login.
-    Brain times out at 30s, so we cap subprocess at 25s.
+    Brain times out at 30 s, so we cap subprocess at 25 s.
     """
+    mode = _env("HOME_AGENT_CLAUDE_MODE", "simple").lower()
     cli = _env("HOME_AGENT_CLAUDE_CLI", "claude")
     model = _env("HOME_AGENT_MODEL", "claude-sonnet-4-6")
     timeout_s = float(_env("HOME_AGENT_TIMEOUT", "25"))
-    max_turns = _env("HOME_AGENT_MAX_TURNS", "3")
 
+    if mode == "upip":
+        return _claude_cli_upip(system, messages, cli, model, timeout_s)
+    return _claude_cli_simple(system, messages, cli, model, timeout_s)
+
+
+def _claude_cli_simple(
+    system: str, messages: list[dict], cli: str, model: str, timeout_s: float
+) -> tuple[str, str]:
+    """Stdin-pipe — fastest path. Single-shot, no tools, no work-dir."""
+    parts: list[str] = []
+    if system:
+        parts.append(f"[system]\n{system}")
+    for m in messages:
+        role = (m.get("role") or "user").upper()
+        content = m.get("content") or ""
+        parts.append(f"\n[{role}]\n{content}")
+    prompt_in = "\n".join(parts)
+
+    proc = subprocess.run(
+        [
+            cli, "-p",
+            "--model", model,
+            "--output-format", "json",
+            "--no-session-persistence",
+        ],
+        input=prompt_in,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-200:]
+        raise RuntimeError(f"claude CLI exit {proc.returncode}: {tail}")
+
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        return (proc.stdout or "").strip() or "(empty)", f"claude_cli/{model}"
+
+    if data.get("is_error"):
+        raise RuntimeError(f"claude CLI: {str(data.get('result') or '')[:200]}")
+
+    answer = str(data.get("result") or "").strip()
+    return answer or "(empty response)", f"claude_cli/{model}"
+
+
+def _claude_cli_upip(
+    system: str, messages: list[dict], cli: str, model: str, timeout_s: float
+) -> tuple[str, str]:
+    """UPIP work-dir — per-thread sandbox, blueprint.md, Read-tool harvest.
+
+    Use when the payload carries L1/L2/L3 split or context attachments
+    that benefit from on-disk presentation. Slower but richer.
+    """
+    max_turns = _env("HOME_AGENT_MAX_TURNS", "3")
     work_id = uuid.uuid4().hex[:12]
     work_dir = pathlib.Path(tempfile.gettempdir()) / f"aint_task_{work_id}"
     work_dir.mkdir(parents=True, exist_ok=True)

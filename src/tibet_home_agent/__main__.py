@@ -20,8 +20,9 @@ def main() -> int:
         print("  OPENAI_API_KEY       — when provider=openai")
         print("  HOME_AGENT_MODEL     — when provider=claude_cli (default claude-sonnet-4-6)")
         print("  HOME_AGENT_CLAUDE_CLI — path to `claude` binary (default 'claude' on PATH)")
+        print("  HOME_AGENT_CLAUDE_MODE — 'simple' (default, stdin pipe, ~3-5s) or 'upip' (work-dir, ~12-17s, rich payloads)")
         print("  HOME_AGENT_TIMEOUT   — claude_cli subprocess timeout seconds (default 25)")
-        print("  HOME_AGENT_MAX_TURNS — claude_cli max turns inside the sandbox (default 3)")
+        print("  HOME_AGENT_MAX_TURNS — claude_cli max turns in upip mode (default 3)")
         print("  POLL_INTERVAL        — inbox poll interval seconds (default 2)")
         return 0
     try:
