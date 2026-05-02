@@ -12,4 +12,4 @@ phone. Mode 3 lets them reuse what they have, with no API key on the
 phone, and prompts never leaving their hardware.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"

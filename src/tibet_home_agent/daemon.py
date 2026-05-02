@@ -282,6 +282,61 @@ _DISPATCHERS = {
 }
 
 
+# ─── v0.4 — Zero-Waste Limitation at the Source ─────────────────────────────
+#
+# Off-grid mobile clients pay battery and bandwidth for every byte of reply
+# they don't actually need. Enforce compactness BEFORE the upstream model
+# generates the long version: terse system-prompt prefix on the way in, hard
+# byte cap on the way out. Cheaper than truncating JSON in RAM after the
+# fact, and the reply stays well under any I-Poll/HTTP-frame cap.
+
+_TERSE_PROMPT_PREFIX = (
+    "Je bent een off-grid TIBET-agent. Antwoord in maximaal 3 zinnen. "
+    "Alleen rauwe data of directe actie. Geen meta-uitleg, geen herhaling "
+    "van de vraag, geen 'Hier is het antwoord:'. "
+    "You are an off-grid TIBET agent. Reply in 3 sentences max. Raw data "
+    "or direct action only. No meta-commentary, no echoing the question, "
+    "no preamble."
+)
+
+
+def _terse_enabled() -> bool:
+    return _env("HOME_AGENT_TERSE", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _apply_terse(system: str) -> str:
+    """Prepend the off-grid terse system prompt unless explicitly disabled.
+
+    Caller's own system prompt is preserved verbatim after the prefix so
+    payload-specific instructions still arrive at the model.
+    """
+    if not _terse_enabled():
+        return system or ""
+    if not system:
+        return _TERSE_PROMPT_PREFIX
+    return f"{_TERSE_PROMPT_PREFIX}\n\n{system}"
+
+
+def _truncate_output(text: str) -> str:
+    """Hard byte cap on the outgoing answer.
+
+    Default 4096 bytes — a comfortable single I-Poll frame on mobile and
+    well under any sane HTTP-body limit. Override with HOME_AGENT_MAX_OUTPUT_BYTES.
+    """
+    try:
+        cap = int(_env("HOME_AGENT_MAX_OUTPUT_BYTES", "4096"))
+    except ValueError:
+        cap = 4096
+    if cap <= 0:
+        return text
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= cap:
+        return text
+    # Cut on a UTF-8 boundary, append a marker so the client knows.
+    truncated = encoded[:cap].decode("utf-8", errors="ignore")
+    return truncated + "\n\n[…truncated by tibet-home-agent at HOME_AGENT_MAX_OUTPUT_BYTES]"
+
+
 # ─── I-Poll wire helpers ────────────────────────────────────────────────────
 
 def _ipoll_headers(token: str, ipoll_token: str) -> dict:
@@ -362,7 +417,9 @@ def _process_one(msg: dict, brain_url: str, my_aint: str, token: str, ipoll_toke
 
     dispatcher = _DISPATCHERS.get(provider, _DISPATCHERS["echo"])
     try:
-        answer, model_used = dispatcher(system, messages)
+        # v0.4 — Zero-Waste Limitation at the Source: terse prefix in, byte cap out.
+        answer, model_used = dispatcher(_apply_terse(system), messages)
+        answer = _truncate_output(answer)
         reply = {
             "type": "chat-response",
             "thread_id": thread_id,
