@@ -41,6 +41,58 @@ from typing import Any
 
 import requests
 
+# ── Cap-bus event emitter — non-fatal, optional import ───────────────────────
+# Emits tibet-cap-bus.gateway-event.v1 records via brain_api/cap_emitter.py.
+# Path can be overridden via HOME_AGENT_CAP_EMITTER_DIR for packaged installs.
+
+_CAP_EMITTER = None
+
+
+def _load_cap_emitter():
+    """Best-effort loader for brain_api.cap_emitter.
+
+    Does not hard-fail home-agent if brain_api is absent. In repo/dev
+    environments the default path works; operators can override via
+    HOME_AGENT_CAP_EMITTER_DIR.
+    """
+    global _CAP_EMITTER
+    if _CAP_EMITTER is not None:
+        return _CAP_EMITTER if _CAP_EMITTER is not False else None
+
+    emitter_dir = os.environ.get(
+        "HOME_AGENT_CAP_EMITTER_DIR", "/srv/jtel-stack/brain_api"
+    ).strip()
+    if emitter_dir and emitter_dir not in sys.path:
+        sys.path.insert(0, emitter_dir)
+
+    try:
+        from cap_emitter import emit_cap_event  # type: ignore
+    except Exception as e:
+        try:
+            _log(f"cap-emitter unavailable: {e}")
+        except Exception:
+            pass
+        _CAP_EMITTER = False
+        return None
+
+    _CAP_EMITTER = emit_cap_event
+    return emit_cap_event
+
+
+def _emit_home_agent_cap_event(**kwargs: Any) -> bool:
+    """Non-fatal emitter wrapper — never blocks the chat path."""
+    emit_cap_event = _load_cap_emitter()
+    if not emit_cap_event:
+        return False
+    try:
+        return bool(emit_cap_event(**kwargs))
+    except Exception as e:
+        try:
+            _log(f"cap-emitter error: {e}")
+        except Exception:
+            pass
+        return False
+
 
 def _env(key: str, default: str = "") -> str:
     v = os.environ.get(key, default)
@@ -415,6 +467,47 @@ def _process_one(msg: dict, brain_url: str, my_aint: str, token: str, ipoll_toke
 
     _log(f"dispatch  {sender} → {my_aint}  thread={thread_id[:8]}  msgs={len(messages)}")
 
+    # ── Emit cap-bus dispatch event (tibet-cap-bus.gateway-event.v1) ────────
+    dispatch_started = time.perf_counter()
+    actor_aint = f"{my_aint}.aint" if not my_aint.endswith(".aint") else my_aint
+    dispatch_envelope_id = f"homecap_{thread_id}"
+    target_url = f"ipoll://{sender}/{thread_id}"
+    surface = f"home-agent-{provider}"
+    configured_model = _env("HOME_AGENT_MODEL", "").strip() or provider
+
+    _emit_home_agent_cap_event(
+        intent="home-agent.bridge.dispatch",
+        operation_id=thread_id,
+        thread_id=thread_id,
+        envelope_id=dispatch_envelope_id,
+        agent_id=actor_aint,
+        actor_aint=actor_aint,
+        surface=surface,
+        provider=provider,
+        model=configured_model,
+        transport="ipoll-home-agent",
+        route_class="relay",
+        status="dispatched",
+        latency_ms=0.0,
+        lane_class="agent-high",
+        lane_collision_policy="graceful_yield",
+        lane_priority=7,
+        preemptible=True,
+        coffee_lane_policy="sip_anyway",
+        coffee_reason="healthy_lane",
+        attestation_layer="none",
+        attestation_ref=f"thread:{thread_id}",
+        target_url=target_url,
+        payload={
+            "poll_type": poll_type,
+            "sender": sender,
+            "message_count": len(messages),
+            "prompt_type": "chat-prompt",
+        },
+        emitter="brain_api.home-agent",
+        observation_layer="tibet-gateway",
+    )
+
     dispatcher = _DISPATCHERS.get(provider, _DISPATCHERS["echo"])
     try:
         # v0.4 — Zero-Waste Limitation at the Source: terse prefix in, byte cap out.
@@ -435,6 +528,48 @@ def _process_one(msg: dict, brain_url: str, my_aint: str, token: str, ipoll_toke
             "error": str(e)[:200],
         }
         _log(f"dispatch error: {e}")
+
+    # ── Emit cap-bus receipt event (parent = dispatch) ──────────────────────
+    elapsed_ms = round((time.perf_counter() - dispatch_started) * 1000.0, 3)
+    ok = bool(reply.get("ok"))
+    model_used = str(reply.get("model_used") or configured_model or provider)
+    answer_text = str(reply.get("answer") or "")
+
+    _emit_home_agent_cap_event(
+        intent="home-agent.bridge.receipt",
+        operation_id=thread_id,
+        thread_id=thread_id,
+        envelope_id=f"{dispatch_envelope_id}:receipt",
+        parent_id=dispatch_envelope_id,
+        agent_id=actor_aint,
+        actor_aint=actor_aint,
+        surface=surface,
+        provider=provider,
+        model=model_used,
+        transport="ipoll-home-agent",
+        route_class="relay",
+        status="executed" if ok else "rejected",
+        latency_ms=elapsed_ms,
+        lane_class="agent-high",
+        lane_collision_policy="graceful_yield",
+        lane_priority=7,
+        preemptible=True,
+        coffee_lane_policy="sip_anyway",
+        coffee_reason="healthy_lane",
+        attestation_layer="none",
+        attestation_ref=f"thread:{thread_id}",
+        target_url=target_url,
+        payload={
+            "poll_type": poll_type,
+            "sender": sender,
+            "ok": ok,
+            "error": reply.get("error"),
+            "answer_bytes": len(answer_text.encode("utf-8")),
+            "message_count": len(messages),
+        },
+        emitter="brain_api.home-agent",
+        observation_layer="tibet-gateway",
+    )
 
     _ipoll_push(brain_url, token, ipoll_token, my_aint, sender, json.dumps(reply))
     _log(f"replied   {my_aint} → {sender}  thread={thread_id[:8]}  ok={reply.get('ok')}")
