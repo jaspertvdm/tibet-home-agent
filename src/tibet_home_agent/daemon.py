@@ -712,6 +712,80 @@ def _handle_kill(
     raise SystemExit(0)
 
 
+def _executed_state_path() -> str:
+    d = _env("HOME_AGENT_STATE_DIR", "/var/lib/tibet-home-agent")
+    return os.path.join(d, "executed-capsules.json")
+
+
+def _load_executed() -> set:
+    try:
+        return set(json.load(open(_executed_state_path())))
+    except Exception:
+        return set()
+
+
+def _save_executed(ids: set) -> None:
+    try:
+        p = _executed_state_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        json.dump(sorted(ids), open(p, "w"))
+    except Exception as e:
+        _log(f"executed-state save failed: {e}")
+
+
+def _execute_approved_capsules(brain_url, my_aint, seed_hex, executed: set) -> None:
+    """B — Heart-in-the-Loop executor (productionised). Find capsules WE created that
+    the operator approved, run the bounded plan (--allowedTools, no root-skip guard),
+    post the result back as a cmail.command.v1, and mark done (dedup via state file)."""
+    if not seed_hex:
+        return
+    agent = my_aint if my_aint.endswith(".aint") else f"{my_aint}.aint"
+    try:
+        r = requests.get(f"{brain_url}/api/capsules/sent",
+                         headers=_m2m_headers(agent, seed_hex), timeout=10)
+        if r.status_code != 200:
+            return
+        capsules = r.json()
+    except Exception as e:
+        _log(f"capsule watch error: {e}")
+        return
+    cli = _env("HOME_AGENT_CLAUDE_CLI", "claude")
+    model = _env("HOME_AGENT_MODEL", "claude-sonnet-4-6")
+    tools = _env("HOME_AGENT_EXEC_TOOLS", "Bash Read Grep Glob")
+    for cap in capsules:
+        cid = cap.get("id")
+        meta = cap.get("metadata") or {}
+        intent = meta.get("intent")
+        if not cid or cid in executed or cap.get("state") != "approved" or not intent:
+            continue
+        _log(f"approved capsule {cid[:8]} → executing (bounded)")
+        try:
+            proc = subprocess.run(
+                [cli, "-p", intent, "--model", model, "--output-format", "json",
+                 "--no-session-persistence", "--allowedTools", tools],
+                capture_output=True, text=True,
+                timeout=float(_env("HOME_AGENT_EXEC_TIMEOUT", "120")))
+            try:
+                result = json.loads(proc.stdout).get("result", "").strip()
+            except Exception:
+                result = (proc.stdout or proc.stderr or "")[:800]
+        except Exception as e:
+            result = f"(execution failed: {e})"
+        operator = cap.get("actor_to") or _env("HOME_AGENT_OPERATOR", "vandemeent")
+        cmail = {"type": "cmail.command.v1", "kind": "result", "from": my_aint,
+                 "to": operator, "subject": f"Uitgevoerd na goedkeuring (capsule {cid[:8]})",
+                 "capsule_id": cid, "result": result, "created": int(time.time())}
+        try:
+            _ipoll_push(brain_url, _env("HOME_AGENT_TOKEN").strip(),
+                        _env("HOME_AGENT_IPOLL_TOKEN").strip(),
+                        my_aint, operator, json.dumps(cmail))
+        except Exception as e:
+            _log(f"result cmail push failed: {e}")
+        executed.add(cid)
+        _save_executed(executed)
+        _log(f"approved capsule {cid[:8]} → executed + result cmail posted to {operator}")
+
+
 def run() -> None:
     """Main poll loop."""
     my_aint = _env("HOME_AGENT_AINT").strip().removesuffix(".aint")
@@ -732,11 +806,24 @@ def run() -> None:
     _log(f"starting  aint={my_aint}.aint  brain={brain_url}  provider={provider}  poll={interval}s")
     if not ipoll_token:
         _log("warning: HOME_AGENT_IPOLL_TOKEN not set — pull may 403 unless localhost-bypassed")
+
+    # B (Heart-in-the-Loop): watch our own approved capsules and execute them.
+    seed = _env("HOME_AGENT_ED25519_SEED").strip()
+    executed = _load_executed()
+    last_cap_check = 0.0
+    cap_check_interval = max(5.0, float(_env("CAPSULE_CHECK_INTERVAL", "15")))
+    if seed:
+        _log(f"approval-executor armed: watching approved capsules every {cap_check_interval}s")
+
     while True:
         try:
             polls = _ipoll_pull(brain_url, my_aint, token, ipoll_token)
             for m in polls:
                 _process_one(m, brain_url, my_aint, token, ipoll_token, provider)
+            now = time.monotonic()
+            if seed and (now - last_cap_check) >= cap_check_interval:
+                _execute_approved_capsules(brain_url, my_aint, seed, executed)
+                last_cap_check = now
         except SystemExit:
             raise
         except Exception as e:
